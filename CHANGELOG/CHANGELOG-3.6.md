@@ -4,7 +4,11 @@ Previous change logs can be found at [CHANGELOG-3.5](https://github.com/etcd-io/
 
 ---
 
-## v3.6.1 (TBD)
+## v3.6.2 (TBD)
+
+---
+
+## v3.6.1 (2025-06-06)
 
 ### etcd server
 
@@ -17,6 +21,10 @@ Previous change logs can be found at [CHANGELOG-3.5](https://github.com/etcd-io/
 ### etcdctl
 
 - Fix [command `etcdctl endpoint health` doesn't work when options are set via environment variables](https://github.com/etcd-io/etcd/pull/20121)
+
+### Dependencies
+
+- Compile binaries using [go 1.23.10](https://github.com/etcd-io/etcd/pull/20128).
 
 ---
 
