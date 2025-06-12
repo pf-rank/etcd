@@ -23,13 +23,11 @@ import (
 	"slices"
 	"time"
 
-	"github.com/anishathalye/porcupine"
 	"github.com/antithesishq/antithesis-sdk-go/assert"
 	"go.uber.org/zap"
 
 	"go.etcd.io/etcd/tests/v3/antithesis/test-template/robustness/common"
 	"go.etcd.io/etcd/tests/v3/robustness/report"
-	"go.etcd.io/etcd/tests/v3/robustness/traffic"
 	"go.etcd.io/etcd/tests/v3/robustness/validate"
 )
 
@@ -58,20 +56,30 @@ func main() {
 	}
 }
 
-func validateReports(lg *zap.Logger, serversDataPath map[string]string, reports []report.ClientReport) validate.Result {
+func validateReports(lg *zap.Logger, serversDataPath map[string]string, reports []report.ClientReport) validate.RobustnessResult {
 	persistedRequests, err := report.PersistedRequests(lg, slices.Collect(maps.Values(serversDataPath)))
-	assert.Always(err == nil, "Loaded persisted requests", map[string]any{"error": err})
+	assertResult(validate.ResultFromError(err), "Loaded persisted requests")
 
-	validateConfig := validate.Config{ExpectRevisionUnique: traffic.EtcdPutDeleteLease.ExpectUniqueRevision()}
+	validateConfig := validate.Config{ExpectRevisionUnique: false}
 	result := validate.ValidateAndReturnVisualize(lg, validateConfig, reports, persistedRequests, 5*time.Minute)
-	assert.Always(result.Assumptions == nil, "Validation assumptions fulfilled", map[string]any{"error": result.Assumptions})
-	if result.Linearization.Linearizable == porcupine.Unknown {
+	assertResult(result.Assumptions, "Validation assumptions fulfilled")
+	if result.Linearization.Timeout {
 		assert.Unreachable("Linearization timeout", nil)
 	} else {
-		assert.Always(result.Linearization.Linearizable == porcupine.Ok, "Linearization validation passes", nil)
+		assertResult(result.Linearization.Result, "Linearization validation passes")
 	}
-	assert.Always(result.WatchError == nil, "Watch validation passes", map[string]any{"error": result.WatchError})
-	assert.Always(result.SerializableError == nil, "Serializable validation passes", map[string]any{"error": result.SerializableError})
+	assertResult(result.Watch, "Watch validation passes")
+	assertResult(result.Serializable, "Serializable validation passes")
 	lg.Info("Completed robustness validation")
 	return result
+}
+
+func assertResult(result validate.Result, name string) {
+	switch result.Status {
+	case validate.Success, validate.Failure:
+		assert.Always(result.Status == validate.Success, name, map[string]any{"msg": result.Message})
+	case validate.Unknown:
+	default:
+		assert.Unreachable(name, map[string]any{"msg": result.Message})
+	}
 }
