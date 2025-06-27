@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"flag"
+	"math/rand/v2"
 	"os"
 	"slices"
 	"sync"
@@ -37,21 +38,35 @@ import (
 	"go.etcd.io/etcd/tests/v3/robustness/traffic"
 )
 
-var profile = traffic.Profile{
-	MinimalQPS:                     100,
-	MaximalQPS:                     1000,
-	BurstableQPS:                   1000,
-	ClientCount:                    3,
-	MaxNonUniqueRequestConcurrency: 3,
-}
+var (
+	profile = traffic.Profile{
+		MinimalQPS:                     100,
+		MaximalQPS:                     1000,
+		BurstableQPS:                   1000,
+		MemberClientCount:              3,
+		ClusterClientCount:             1,
+		MaxNonUniqueRequestConcurrency: 3,
+	}
+	trafficNames = []string{
+		"etcd",
+		"kubernetes",
+	}
+	traffics = []traffic.Traffic{
+		traffic.EtcdPutDeleteLease,
+		traffic.Kubernetes,
+	}
+	NodeCount = "3"
+)
 
 func main() {
 	local := flag.Bool("local", false, "run tests locally and connect to etcd instances via localhost")
 	flag.Parse()
 
-	reportPath, hosts, etcdetcdDataPaths := common.DefaultPaths()
+	cfg := common.MakeConfig(NodeCount)
+
+	hosts, reportPath, etcdetcdDataPaths := common.DefaultPaths(cfg)
 	if *local {
-		reportPath, hosts, etcdetcdDataPaths = common.LocalPaths()
+		hosts, reportPath, etcdetcdDataPaths = common.LocalPaths(cfg)
 	}
 
 	ctx := context.Background()
@@ -62,7 +77,10 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	r := report.TestReport{Logger: lg, ServersDataPath: etcdetcdDataPaths}
+	choice := rand.IntN(len(traffics))
+	tf := traffics[choice]
+	lg.Info("Traffic", zap.String("Type", trafficNames[choice]))
+	r := report.TestReport{Logger: lg, ServersDataPath: etcdetcdDataPaths, Traffic: &report.TrafficDetail{ExpectUniqueRevision: tf.ExpectUniqueRevision()}}
 	defer func() {
 		if err = r.Report(reportPath); err != nil {
 			lg.Error("Failed to save traffic generation report", zap.Error(err))
@@ -70,21 +88,21 @@ func main() {
 	}()
 
 	lg.Info("Start traffic generation", zap.Duration("duration", duration))
-	r.Client, err = runTraffic(ctx, lg, hosts, baseTime, duration)
+	r.Client, err = runTraffic(ctx, lg, tf, hosts, baseTime, duration)
 	if err != nil {
 		lg.Error("Failed to generate traffic")
 		panic(err)
 	}
 }
 
-func runTraffic(ctx context.Context, lg *zap.Logger, hosts []string, baseTime time.Time, duration time.Duration) ([]report.ClientReport, error) {
+func runTraffic(ctx context.Context, lg *zap.Logger, tf traffic.Traffic, hosts []string, baseTime time.Time, duration time.Duration) ([]report.ClientReport, error) {
 	ids := identity.NewIDProvider()
-	r, err := traffic.CheckEmptyDatabaseAtStart(ctx, lg, hosts, ids, baseTime)
+	trafficSet := client.NewSet(ids, baseTime)
+	defer trafficSet.Close()
+	err := traffic.CheckEmptyDatabaseAtStart(ctx, lg, hosts, trafficSet)
 	if err != nil {
 		lg.Fatal("Failed empty database at start check", zap.Error(err))
 	}
-	trafficReports := []report.ClientReport{r}
-	watchReport := []report.ClientReport{}
 	maxRevisionChan := make(chan int64, 1)
 	watchConfig := client.WatchConfig{
 		RequestProgress: true,
@@ -93,22 +111,23 @@ func runTraffic(ctx context.Context, lg *zap.Logger, hosts []string, baseTime ti
 	startTime := time.Since(baseTime)
 	g.Go(func() error {
 		defer close(maxRevisionChan)
-		trafficReports = slices.Concat(trafficReports, simulateTraffic(ctx, hosts, ids, baseTime, duration))
-		maxRevision := report.OperationsMaxRevision(trafficReports)
+		simulateTraffic(ctx, tf, hosts, trafficSet, duration)
+		maxRevision := report.OperationsMaxRevision(trafficSet.Reports())
 		maxRevisionChan <- maxRevision
 		lg.Info("Finished simulating Traffic", zap.Int64("max-revision", maxRevision))
 		return nil
 	})
+	watchSet := client.NewSet(ids, baseTime)
+	defer watchSet.Close()
 	g.Go(func() error {
-		var err error
-		watchReport, err = client.CollectClusterWatchEvents(ctx, lg, hosts, maxRevisionChan, watchConfig, baseTime, ids)
+		err := client.CollectClusterWatchEvents(ctx, lg, hosts, maxRevisionChan, watchConfig, watchSet)
 		return err
 	})
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
 	endTime := time.Since(baseTime)
-	reports := slices.Concat(trafficReports, watchReport)
+	reports := slices.Concat(trafficSet.Reports(), watchSet.Reports())
 	totalStats := traffic.CalculateStats(reports, startTime, endTime)
 	lg.Info("Completed traffic generation",
 		zap.Int("successes", totalStats.Successes),
@@ -120,51 +139,86 @@ func runTraffic(ctx context.Context, lg *zap.Logger, hosts []string, baseTime ti
 	return reports, nil
 }
 
-func simulateTraffic(ctx context.Context, hosts []string, ids identity.Provider, baseTime time.Time, duration time.Duration) []report.ClientReport {
-	var mux sync.Mutex
+func simulateTraffic(ctx context.Context, tf traffic.Traffic, hosts []string, clientSet *client.ClientSet, duration time.Duration) {
 	var wg sync.WaitGroup
 	storage := identity.NewLeaseIDStorage()
 	limiter := rate.NewLimiter(rate.Limit(profile.MaximalQPS), profile.BurstableQPS)
 	concurrencyLimiter := traffic.NewConcurrencyLimiter(profile.MaxNonUniqueRequestConcurrency)
 	finish := closeAfter(ctx, duration)
-	reports := []report.ClientReport{}
 	keyStore := traffic.NewKeyStore(10, "key")
-	for i := 0; i < profile.ClientCount; i++ {
-		c := connect([]string{hosts[i%len(hosts)]}, ids, baseTime)
-		defer c.Close()
+	for i := range profile.MemberClientCount {
+		c := connect(clientSet, []string{hosts[i%len(hosts)]})
 		wg.Add(1)
 		go func(c *client.RecordingClient) {
 			defer wg.Done()
 			defer c.Close()
-
-			traffic.EtcdPutDeleteLease.RunTrafficLoop(ctx, c, limiter,
-				ids,
+			tf.RunTrafficLoop(ctx, c, limiter,
+				clientSet.IdentityProvider(),
 				storage,
 				concurrencyLimiter,
 				keyStore,
 				finish,
 			)
-			mux.Lock()
-			reports = append(reports, c.Report())
-			mux.Unlock()
+		}(c)
+	}
+	for range profile.ClusterClientCount {
+		c := connect(clientSet, hosts)
+		wg.Add(1)
+		go func(c *client.RecordingClient) {
+			defer wg.Done()
+			defer c.Close()
+			tf.RunTrafficLoop(ctx, c, limiter,
+				clientSet.IdentityProvider(),
+				storage,
+				concurrencyLimiter,
+				keyStore,
+				finish,
+			)
 		}(c)
 	}
 	wg.Add(1)
-	compactClient := connect(hosts, ids, baseTime)
+	compactClient := connect(clientSet, hosts)
 	go func(c *client.RecordingClient) {
 		defer wg.Done()
 		defer c.Close()
-		traffic.EtcdPutDeleteLease.RunCompactLoop(ctx, c, traffic.DefaultCompactionPeriod, finish)
-		mux.Lock()
-		reports = append(reports, c.Report())
-		mux.Unlock()
+		tf.RunCompactLoop(ctx, c, traffic.DefaultCompactionPeriod, finish)
 	}(compactClient)
+	defragPeriod := traffic.DefaultCompactionPeriod * time.Duration(len(hosts))
+	for _, h := range hosts {
+		c := connect(clientSet, []string{h})
+		wg.Add(1)
+		go func(c *client.RecordingClient) {
+			defer wg.Done()
+			defer c.Close()
+			runDefragLoop(ctx, c, defragPeriod, finish)
+		}(c)
+	}
 	wg.Wait()
-	return reports
 }
 
-func connect(endpoints []string, ids identity.Provider, baseTime time.Time) *client.RecordingClient {
-	cli, err := client.NewRecordingClient(endpoints, ids, baseTime)
+func runDefragLoop(ctx context.Context, c *client.RecordingClient, period time.Duration, finish <-chan struct{}) {
+	jittered := time.Duration(robustnessrand.RandRange(int64(period-period/2), int64(period+period/2)))
+	ticker := time.NewTicker(jittered)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-finish:
+			return
+		case <-ticker.C:
+		}
+		dctx, cancel := context.WithTimeout(ctx, traffic.RequestTimeout)
+		_, err := c.Defragment(dctx)
+		cancel()
+		if err != nil {
+			continue
+		}
+	}
+}
+
+func connect(cs *client.ClientSet, endpoints []string) *client.RecordingClient {
+	cli, err := cs.NewClient(endpoints)
 	if err != nil {
 		// Antithesis Assertion: client should always be able to connect to an etcd host
 		assert.Unreachable("Client failed to connect to an etcd host", map[string]any{"endpoints": endpoints, "error": err})
